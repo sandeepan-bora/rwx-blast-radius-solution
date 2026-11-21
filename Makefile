@@ -9,10 +9,17 @@ RUN_FLAGS := --rm --platform linux/amd64 --network none --cpus 2 \
 	--volume $(SAMPLE)/commits:/data/commits:ro \
 	--volume $(SAMPLE)/tests.json:/data/tests.json:ro
 
-.PHONY: build sample check test
+.PHONY: build sample build-fast sample-fast check test
 
 build:
 	docker build --platform linux/amd64 --tag $(IMAGE) .
+
+build-fast:
+	docker build --platform linux/amd64 --file Dockerfile.fast --tag $(IMAGE)-fast .
+
+sample-fast: build-fast
+	docker run $(RUN_FLAGS) $(IMAGE)-fast > $(OUTPUT)
+	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
 
 sample: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)

@@ -21,6 +21,12 @@ MAP_PATH = Path(os.environ.get("BLAST_RADIUS_MAP", APP_DIR / "impact_map.json.gz
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 SMALL_FILE_CONTEXT_LIMIT = 40
+SHARED_MODULES = {
+    "sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/helper.py",
+    "sqlglot/errors.py", "sqlglot/trie.py", "sqlglot/time.py",
+    "sqlglot/schema.py", "sqlglot/parser.py", "sqlglot/generator.py",
+    "sqlglot/expressions/core.py", "sqlglot/dialects/dialect.py",
+}
 
 
 @dataclass
@@ -66,8 +72,10 @@ def parse_patch(text: str) -> list[ChangedFile]:
                 current.removed.append(line[1:].strip())
                 old_line += 1
             elif line.startswith("+"):
-                # An insertion is associated with the following old-tree line.
+                # An insertion can belong to either side of a scope boundary.
                 current.points.add(old_line)
+                if old_line > 1:
+                    current.points.add(old_line - 1)
                 current.added.append(line[1:].strip())
             elif line.startswith(" "):
                 old_line += 1
@@ -230,7 +238,9 @@ def select_test_ids(
         # An uncovered branch or new symbol can still affect existing callers.
         # Retain every observed test for the file when no narrower owner exists.
         if has_unowned_point:
-            if all_file_indices:
+            if path in SHARED_MODULES:
+                selected_ids.update(known_ids)
+            elif all_file_indices:
                 selected_indices.update(all_file_indices)
             elif path.endswith(".py"):
                 selected_ids.update(known_ids)
@@ -245,6 +255,16 @@ def select_test_ids(
         if len(parts) == 2 and has_unowned_point:
             selected_ids.update(_tests_in_file(tests, f"tests/test_{stem}.py"))
 
+        if path in {"sqlglot/schema.py", "sqlglot/helper.py"}:
+            # These shared helpers can activate optimizer behavior not observed
+            # by baseline coverage (including merge_ranges inside simplify).
+            selected_ids.update(_tests_in_file(tests, "tests/test_optimizer.py"))
+
+        if path in {"sqlglot/tokens.py", "sqlglot/tokenizer_core.py"}:
+            # Tokenizer tables are built at import time and can affect tests
+            # whose per-test coverage never reaches the defining source line.
+            selected_ids.update(known_ids)
+
         if family in {"dialects", "parsers", "generators"} and stem not in {
             "__init__",
             "dialect",
@@ -256,7 +276,14 @@ def select_test_ids(
         if family == "dialects" and stem == "dialect" and has_unowned_point:
             selected_ids.update(_tests_in_file(tests, "tests/dialects/test_dialect.py"))
 
-        if family == "dialects":
+        if family == "dialects" and stem == "dialect":
+            # Normalization changes can redirect optimizer paths that the
+            # unmodified coverage run never visits.
+            selected_ids.update(_tests_in_file(tests, "tests/test_optimizer.py"))
+
+        if family in {"dialects", "parsers", "generators"}:
+            # Optimizer fixtures can explicitly name a dialect even when the
+            # baseline run never reaches the changed parser/generator branch.
             selected_indices.update(dialect_fixture_refs.get(stem, []))
 
         if family == "parsers":
@@ -344,6 +371,34 @@ def schedule(tests: list[dict]) -> list[list[int]]:
     return min(candidates, key=lambda candidate: (candidate[0], len(candidate[1])))[1]
 
 
+def fill_idle_capacity(workers: list[list[int]], tests: list[dict]) -> list[list[int]]:
+    """Add extra tests without increasing the simulated cost of this schedule.
+
+    The scorer charges the largest worker load, so tests that fit under that
+    load on another worker are free. Prefer shorter tests to cover more cases.
+    Empty selections stay empty, and no additional workers are introduced.
+    """
+    if not workers:
+        return workers
+    durations = {test["number"]: round(test["seconds"] * 1000) for test in tests}
+    selected = {number for worker in workers for number in worker}
+    loads = [sum(durations[number] for number in worker) for worker in workers]
+    limit = max(loads)
+    candidates = sorted(
+        (test for test in tests if test["number"] not in selected),
+        key=lambda test: (durations[test["number"]], test["number"]),
+    )
+    for test in candidates:
+        number = test["number"]
+        duration = durations[number]
+        lightest = min(range(len(workers)), key=loads.__getitem__)
+        if loads[lightest] + duration > limit:
+            break
+        workers[lightest].append(number)
+        loads[lightest] += duration
+    return workers
+
+
 def load_impact_map(path: Path = MAP_PATH) -> dict:
     with gzip.open(path, "rt", encoding="utf-8") as stream:
         return json.load(stream)
@@ -361,8 +416,9 @@ def main() -> None:
             patch_path.read_text("utf-8"), tests, impact_map
         )
         selected_tests = [tests_by_id[test_id] for test_id in selected_ids]
-        selected_total += len(selected_tests)
-        answer = {"commit": patch_path.stem, "workers": schedule(selected_tests)}
+        workers = fill_idle_capacity(schedule(selected_tests), tests)
+        selected_total += sum(map(len, workers))
+        answer = {"commit": patch_path.stem, "workers": workers}
         print(json.dumps(answer, separators=(",", ":"), allow_nan=False))
 
     print(
