@@ -108,6 +108,20 @@ def _scope_ids(file_map: dict, line: int) -> set[int]:
     return set(smallest[2])
 
 
+def _class_ids(file_map: dict, line: int) -> set[int]:
+    """Return tests that instantiated the smallest enclosing runtime class."""
+
+    candidates = [
+        scope
+        for scope in file_map.get("classes", [])
+        if scope[0] <= line <= scope[1]
+    ]
+    if not candidates:
+        return set()
+    smallest = min(candidates, key=lambda scope: scope[1] - scope[0])
+    return set(smallest[2])
+
+
 def _fixture_fallback_ids(path: str, tests: list[dict]) -> set[str]:
     """Route a new/unmapped fixture using its directory and normalized stem."""
 
@@ -122,7 +136,7 @@ def _fixture_fallback_ids(path: str, tests: list[dict]) -> set[str]:
     for test in tests:
         method = test["id"].rsplit("::", 1)[-1].removeprefix("test_").lower()
         if group == "optimizer":
-            if any(
+            if test["file"] == "tests/test_optimizer.py" and any(
                 method == candidate
                 or method.startswith(f"{candidate}__")
                 or candidate.startswith(f"{method}_")
@@ -166,15 +180,18 @@ def select_test_ids(
             continue
 
         if path.startswith("tests/"):
-            selected_ids.update(_tests_in_file(tests, path))
-            continue
+            direct_tests = _tests_in_file(tests, path)
+            if direct_tests:
+                selected_ids.update(direct_tests)
+                continue
 
-        if not path.startswith("sqlglot/"):
+        if not path.startswith("sqlglot/") and path not in files:
             continue
 
         file_map = files.get(path, {})
         for point in change.points:
-            selected_indices.update(_scope_ids(file_map, point))
+            scoped = _scope_ids(file_map, point)
+            selected_indices.update(scoped or _class_ids(file_map, point))
 
         all_file_indices = file_map.get("all", [])
         if len(all_file_indices) <= SMALL_FILE_CONTEXT_LIMIT:
@@ -183,6 +200,12 @@ def select_test_ids(
         parts = Path(path).parts
         family = parts[1] if len(parts) > 2 else ""
         stem = Path(path).stem
+
+        # Top-level modules have direct test files but no family-specific rule.
+        # This primarily protects module constants and import-time registries,
+        # which per-test coverage cannot observe during collection.
+        if len(parts) == 2:
+            selected_ids.update(_tests_in_file(tests, f"tests/test_{stem}.py"))
 
         if family in {"dialects", "parsers", "generators"} and stem not in {
             "__init__",

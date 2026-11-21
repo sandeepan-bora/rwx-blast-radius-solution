@@ -35,6 +35,12 @@ def fixture_test_indices(path: str, test_ids: list[str]) -> list[int]:
     group = parts[2].lower() if len(parts) > 2 else ""
     stem = Path(path).stem.lower()
     candidates = {stem, stem.rstrip("s")}
+    candidates.update(
+        {
+            "annotate_funcs" if stem == "annotate_functions" else stem,
+            "optimize" if stem == "optimizer" else stem,
+        }
+    )
     if stem.endswith("ies"):
         candidates.add(f"{stem[:-3]}y")
 
@@ -42,7 +48,7 @@ def fixture_test_indices(path: str, test_ids: list[str]) -> list[int]:
     for index, test_id in enumerate(test_ids):
         method = test_id.rsplit("::", 1)[-1].removeprefix("test_").lower()
         if group == "optimizer":
-            if any(
+            if test_id.startswith("tests/test_optimizer.py::") and any(
                 method == candidate
                 or method.startswith(f"{candidate}__")
                 or candidate.startswith(f"{method}_")
@@ -51,15 +57,92 @@ def fixture_test_indices(path: str, test_ids: list[str]) -> list[int]:
                 selected.append(index)
         elif group and test_id.startswith(f"tests/dialects/test_{group}.py::"):
             selected.append(index)
-    return selected
+
+    # These fixture owners are visible in the pinned suite but do not follow
+    # the optimizer filename convention above (root fixtures and TPC data).
+    explicit_ids: set[str] = set()
+    if path == "tests/fixtures/identity.sql":
+        explicit_ids.update(
+            {
+                "tests/test_serde.py::TestSerde::test_serde",
+                "tests/test_transpile.py::TestTranspile::test_identity",
+            }
+        )
+    elif path == "tests/fixtures/partial.sql":
+        explicit_ids.add("tests/test_transpile.py::TestTranspile::test_partial")
+    elif path == "tests/fixtures/pretty.sql":
+        explicit_ids.add("tests/test_transpile.py::TestTranspile::test_pretty")
+    elif path.endswith("/jsonpath/cts.json"):
+        explicit_ids.add("tests/test_jsonpath.py::TestJsonpath::test_cts_file")
+    elif "/tpc-ds/" in path:
+        explicit_ids.update(
+            {
+                "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+                "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+            }
+        )
+    elif "/tpc-h/" in path:
+        explicit_ids.update(
+            {
+                "tests/test_optimizer.py::TestOptimizer::test_tpch",
+                "tests/test_executor.py::TestExecutor::test_execute_tpch",
+                "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+            }
+        )
+
+    selected.extend(
+        index for index, test_id in enumerate(test_ids) if test_id in explicit_ids
+    )
+    return sorted(set(selected))
 
 
-def build_map(repo: Path, coverage_path: Path, tests_path: Path) -> dict:
+def _class_scopes(
+    tree: ast.AST,
+    module: str,
+    usage: dict[str, list[str]],
+    index_by_id: dict[str, int],
+    contexts_by_line: dict[int, set[int]],
+) -> list[list]:
+    scopes: list[list] = []
+
+    def visit(body: list[ast.stmt], parents: tuple[str, ...] = ()) -> None:
+        for node in body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            qualname = ".".join((*parents, node.name))
+            selected = {
+                index_by_id[test_id]
+                for test_id in usage.get(f"{module}.{qualname}", ())
+                if test_id in index_by_id
+            }
+            # Generic classes are not part of the runtime usage tracer.  Tests
+            # that execute any method of such a class are still a strong owner
+            # signal for constants and registries declared in its body.
+            for line in range(node.lineno, node.end_lineno + 1):
+                selected.update(contexts_by_line.get(line, ()))
+            if selected:
+                scopes.append([node.lineno, node.end_lineno, sorted(selected)])
+            visit(node.body, (*parents, node.name))
+
+    visit(getattr(tree, "body", []))
+    return sorted(scopes, key=lambda scope: (scope[0], scope[1]))
+
+
+def build_map(
+    repo: Path,
+    coverage_path: Path,
+    tests_path: Path,
+    class_usage_path: Path | None = None,
+) -> dict:
     tests = json.loads(tests_path.read_text("utf-8"))["tests"]
     test_ids = [test["id"] for test in tests]
+    index_by_id = {test_id: index for index, test_id in enumerate(test_ids)}
     index_by_context = {
         test_context(test_id): index for index, test_id in enumerate(test_ids)
     }
+    class_usage = (
+        json.loads(class_usage_path.read_text("utf-8")) if class_usage_path else {}
+    )
 
     data = CoverageData(basename=str(coverage_path.resolve()))
     data.read()
@@ -72,7 +155,7 @@ def build_map(repo: Path, coverage_path: Path, tests_path: Path) -> dict:
             relative = source_path.relative_to(repo).as_posix()
         except ValueError:
             continue
-        if not relative.startswith("sqlglot/"):
+        if not relative.startswith(("sqlglot/", "tests/")):
             continue
 
         contexts_by_line: dict[int, set[int]] = {}
@@ -85,6 +168,7 @@ def build_map(repo: Path, coverage_path: Path, tests_path: Path) -> dict:
 
         all_indices = sorted(set().union(*contexts_by_line.values())) if contexts_by_line else []
         scopes: list[list] = []
+        classes: list[list] = []
         try:
             tree = ast.parse(source_path.read_text("utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
@@ -98,8 +182,16 @@ def build_map(repo: Path, coverage_path: Path, tests_path: Path) -> dict:
                     selected.update(contexts_by_line.get(line, ()))
                 if selected:
                     scopes.append([node.lineno, node.end_lineno, sorted(selected)])
+            module = relative[:-3].replace("/", ".")
+            classes = _class_scopes(
+                tree,
+                module,
+                class_usage,
+                index_by_id,
+                contexts_by_line,
+            )
         scopes.sort(key=lambda scope: (scope[0], scope[1]))
-        files[relative] = {"all": all_indices, "scopes": scopes}
+        files[relative] = {"all": all_indices, "scopes": scopes, "classes": classes}
 
     fixtures: dict[str, list[int]] = {}
     dialect_fixture_refs: dict[str, set[int]] = {}
@@ -117,7 +209,7 @@ def build_map(repo: Path, coverage_path: Path, tests_path: Path) -> dict:
             dialect_fixture_refs.setdefault(dialect, set()).update(owners)
 
     return {
-        "schema": 1,
+        "schema": 2,
         "pinned_commit": PINNED_COMMIT,
         "test_ids": test_ids,
         "files": files,
@@ -142,10 +234,16 @@ def main() -> None:
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--coverage-data", type=Path, required=True)
     parser.add_argument("--tests-json", type=Path, required=True)
+    parser.add_argument("--class-usage", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     options = parser.parse_args()
     write_deterministic_gzip(
-        build_map(options.repo, options.coverage_data, options.tests_json),
+        build_map(
+            options.repo,
+            options.coverage_data,
+            options.tests_json,
+            options.class_usage,
+        ),
         options.output,
     )
 

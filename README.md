@@ -31,16 +31,23 @@ its tests independently.
 
 ## Design
 
-The selector combines four reusable signals:
+The selector combines six reusable signals:
 
 1. **Per-function coverage scopes.** `impact_map.json.gz` records which tests
    executed each function in the unmodified pinned repository.
-2. **Exact fixture routing.** An optimizer fixture such as
+2. **Runtime class ownership.** Build-time tracing records which tests
+   instantiate each expression, dialect, parser, generator, and tokenizer
+   class. This covers class constants that execute before per-test coverage
+   begins.
+3. **Exact fixture routing.** An optimizer fixture such as
    `pushdown_predicates.sql` routes to its matching optimizer test instead of the
-   entire optimizer file.
-3. **Family fallbacks.** Dialect/parser/generator changes include their direct
+   entire optimizer file. Root, JSONPath, and TPC fixtures have explicit owners
+   derived from the pinned suite.
+4. **Shared test-helper coverage.** Changes to `tests/helpers.py` route to the
+   tests that execute the changed helper instead of selecting nothing.
+5. **Family fallbacks.** Dialect/parser/generator changes include their direct
    dialect tests; shared or import-time behavior gets small conservative sentinels.
-4. **Patch risk.** Comment-only files select nothing. Optimizer control-flow
+6. **Patch risk.** Comment-only files select nothing. Optimizer control-flow
    mutations add the slow integration sentinels because their blast radius is
    substantially wider.
 
@@ -59,14 +66,23 @@ included here as `coverage.ini`):
 
 ```ini
 [run]
-source = sqlglot
+source = sqlglot,tests
 dynamic_context = test_function
 ```
 
-Collect coverage from the unmodified checkout:
+Collect coverage from the unmodified checkout (including shared test helpers):
 
 ```sh
 SKIP_INTEGRATION=0 coverage run --rcfile=/path/to/coverage.ini -m pytest -q
+```
+
+Collect runtime class ownership in a separate clean test run:
+
+```sh
+CLASS_USAGE_OUTPUT=/tmp/class-usage.json \
+  PYTHONPATH=/path/to/this-repository \
+  SKIP_INTEGRATION=0 \
+  python -m pytest -q -p tools.collect_class_usage
 ```
 
 Then build the map from this repository:
@@ -76,6 +92,7 @@ python tools/build_impact_map.py \
   --repo /path/to/sqlglot \
   --coverage-data /path/to/sqlglot/.coverage \
   --tests-json sample/tests.json \
+  --class-usage /tmp/class-usage.json \
   --output impact_map.json.gz
 ```
 
@@ -96,20 +113,25 @@ sample score and local CPU measurement are recorded below after verification.
 
 - Pinned test collection: 1,620 scored tests plus the one test listed as skipped.
 - Unchanged starter baseline: **1,210.470 simulated seconds, 0 misses**.
-- Full pinned suite used to build the map: **1,620 passed, 1 skipped in 95.90 s**.
-- Optimized sample, repeated three times: **139.731 simulated seconds, 0 misses**
-  each time; all three JSONL outputs were byte-identical.
-- Local selector CPU proxy: median **0.03 s user + 0.00 s system**, implying
-  about **139.8 s** after tenth-second score rounding on this machine. Server CPU
-  accounting and hardware can differ.
-- Unit/integration tests: **5 passed**.
-- Submission directory size during verification: **684 KB**, below the 20 MB
+- Pinned coverage run used to build the map: **1,620 passed, 1 skipped in
+  96.21 s**. The separate class-ownership run also passed all 1,620 tests with
+  one skip.
+- Original v1 sample: **139.731 simulated seconds, 0 misses**. Its first practice
+  submission (`fa44e83`) exposed hidden-set blind spots and scored **1620.7 s**:
+  120.371 simulated test seconds plus five 300-second miss penalties, with
+  about 0.33 CPU seconds. This result was deterministic across all three runs.
+- Revised v2 sample: **150.533 simulated seconds, 0 misses**; **150.573 total**
+  when supplied a conservative 0.04-second local CPU measurement. The added
+  ~10.8 simulated seconds are a deliberate recall premium for class constants,
+  previously unowned fixtures, and shared test helpers.
+- Revised hidden/practice score: **not measured yet**. Any sub-160 estimate is a
+  projection, not a verified leaderboard result.
+- Unit/integration tests: **8 passed**.
+- Submission directory size during verification: **1.2 MB**, below the 20 MB
   repository limit.
 - Docker was not available on the verification host, so `make sample` itself was
   not executed there. The same selector output was checked directly with the
   supplied official `score.py`.
-- Contest/leaderboard score: **not measured**. Do not treat a local sample number
-  as a guaranteed hidden-set or leaderboard result.
 
 ## Submission notes
 

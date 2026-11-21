@@ -59,6 +59,54 @@ class SchedulerTests(unittest.TestCase):
 
 
 class SampleIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tests = json.loads((ROOT / "sample" / "tests.json").read_text())["tests"]
+        cls.impact_map = selector.load_impact_map(ROOT / "impact_map.json.gz")
+
+    def select(self, patch: str) -> set[str]:
+        return selector.select_test_ids(patch, self.tests, self.impact_map)
+
+    def test_root_fixture_has_explicit_owners(self) -> None:
+        patch = """\
+diff --git a/tests/fixtures/identity.sql b/tests/fixtures/identity.sql
+--- a/tests/fixtures/identity.sql
++++ b/tests/fixtures/identity.sql
+@@ -1 +1 @@
+-SELECT 1;
++SELECT 2;
+"""
+        selected = self.select(patch)
+        self.assertIn("tests/test_serde.py::TestSerde::test_serde", selected)
+        self.assertIn("tests/test_transpile.py::TestTranspile::test_identity", selected)
+
+    def test_class_constant_uses_runtime_class_owners(self) -> None:
+        patch = """\
+diff --git a/sqlglot/expressions/ddl.py b/sqlglot/expressions/ddl.py
+--- a/sqlglot/expressions/ddl.py
++++ b/sqlglot/expressions/ddl.py
+@@ -82 +82 @@ class TriggerProperties(Expression):
+-        \"constraint\": False,
++        \"constraint\": True,
+"""
+        selected = self.select(patch)
+        self.assertIn(
+            "tests/dialects/test_postgres.py::TestPostgres::test_postgres_create_trigger",
+            selected,
+        )
+
+    def test_shared_test_helper_uses_coverage_owners(self) -> None:
+        patch = """\
+diff --git a/tests/helpers.py b/tests/helpers.py
+--- a/tests/helpers.py
++++ b/tests/helpers.py
+@@ -35 +35 @@ def load_sql_fixtures(filename):
+-    with open(path) as f:
++    with open(path, encoding=\"utf-8\") as f:
+"""
+        selected = self.select(patch)
+        self.assertIn("tests/test_transpile.py::TestTranspile::test_identity", selected)
+
     def test_sample_is_valid_zero_miss_and_below_target(self) -> None:
         sample = ROOT / "sample"
         if not sample.exists():
