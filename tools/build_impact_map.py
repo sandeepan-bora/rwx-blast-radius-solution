@@ -17,6 +17,7 @@ import ast
 import gzip
 import json
 import re
+import tokenize
 from pathlib import Path
 
 from coverage import CoverageData
@@ -248,6 +249,7 @@ def build_map(
     coverage_path: Path,
     tests_path: Path,
     class_usage_path: Path | None = None,
+    subprocess_coverage_path: Path | None = None,
 ) -> dict:
     tests = json.loads(tests_path.read_text("utf-8"))["tests"]
     test_ids = [test["id"] for test in tests]
@@ -261,13 +263,23 @@ def build_map(
 
     data = CoverageData(basename=str(coverage_path.resolve()))
     data.read()
+    subprocess_usage = (
+        json.loads(subprocess_coverage_path.read_text("utf-8"))
+        if subprocess_coverage_path else {}
+    )
     external_symbols, external_classes = _cross_module_usage(
         repo, data, index_by_context
     )
     files: dict[str, dict] = {}
     repo = repo.resolve()
 
-    for measured_path in sorted(data.measured_files()):
+    measured_files = set(data.measured_files())
+    extra_files = {
+        str(repo / relative)
+        for by_file in subprocess_usage.values()
+        for relative in by_file
+    }
+    for measured_path in sorted(measured_files | extra_files):
         source_path = Path(measured_path).resolve()
         try:
             relative = source_path.relative_to(repo).as_posix()
@@ -277,12 +289,19 @@ def build_map(
             continue
 
         contexts_by_line: dict[int, set[int]] = {}
-        for line, contexts in data.contexts_by_lineno(measured_path).items():
+        measured_lines = data.contexts_by_lineno(measured_path) if measured_path in measured_files else {}
+        for line, contexts in measured_lines.items():
             contexts_by_line[line] = {
                 index_by_context[context]
                 for context in contexts
                 if context in index_by_context
             }
+        baseline_contexts = {line: set(indices) for line, indices in contexts_by_line.items()}
+        for test_id, by_file in subprocess_usage.items():
+            if test_id not in index_by_id:
+                raise ValueError(f"unknown subprocess test: {test_id}")
+            for line in by_file.get(relative, ()):
+                contexts_by_line.setdefault(line, set()).add(index_by_id[test_id])
 
         all_indices = sorted(set().union(*contexts_by_line.values())) if contexts_by_line else []
         scopes: list[list] = []
@@ -300,7 +319,25 @@ def build_map(
                 for line in range(node.lineno, node.end_lineno + 1):
                     selected.update(contexts_by_line.get(line, ()))
                 if selected:
-                    scopes.append([node.lineno, node.end_lineno, sorted(selected)])
+                    # Importing a module executes multi-line function headers,
+                    # even when its body never runs. Preserve those owners for
+                    # signature/docstring changes but not unrelated body edits.
+                    body = node.body
+                    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                        body = body[1:]
+                    body_start = body[0].lineno if body else node.end_lineno + 1
+                    if node.lineno < body_start:
+                        scopes.append([node.lineno, body_start - 1, sorted(selected)])
+                    # Keep every original owner; only the newly collected
+                    # subprocess header-only hits are excluded from bodies.
+                    body_selected: set[int] = set().union(*(
+                        baseline_contexts.get(line, set())
+                        for line in range(node.lineno, node.end_lineno + 1)
+                    ))
+                    for line in range(body_start, node.end_lineno + 1):
+                        body_selected.update(contexts_by_line.get(line, ()))
+                    if body_selected:
+                        scopes.append([body_start, node.end_lineno, sorted(body_selected)])
             module = relative[:-3].replace("/", ".")
             if module.endswith(".__init__"):
                 module = module.removesuffix(".__init__")
@@ -319,11 +356,30 @@ def build_map(
                 external_symbols,
             )
         scopes.sort(key=lambda scope: (scope[0], scope[1]))
+        strings = []
+        try:
+            with tokenize.open(source_path) as source:
+                strings = [
+                    [token.start[0], token.end[0]]
+                    for token in tokenize.generate_tokens(source.readline)
+                    if token.type == tokenize.STRING and token.end[0] > token.start[0]
+                ]
+        except (OSError, SyntaxError, UnicodeError, tokenize.TokenError):
+            pass
+        # Python 3.12+ tokenizes f-strings separately from ordinary STRINGs.
+        if tree is not None:
+            strings.extend(
+                [node.lineno, node.end_lineno]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.JoinedStr) and node.end_lineno > node.lineno
+            )
+        strings = [list(span) for span in sorted({tuple(span) for span in strings})]
         files[relative] = {
             "all": all_indices,
             "scopes": scopes,
             "classes": classes,
             "globals": globals_,
+            "strings": strings,
         }
 
     fixtures: dict[str, list[int]] = {}
@@ -368,6 +424,7 @@ def main() -> None:
     parser.add_argument("--coverage-data", type=Path, required=True)
     parser.add_argument("--tests-json", type=Path, required=True)
     parser.add_argument("--class-usage", type=Path)
+    parser.add_argument("--subprocess-coverage", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     options = parser.parse_args()
     write_deterministic_gzip(
@@ -376,6 +433,7 @@ def main() -> None:
             options.coverage_data,
             options.tests_json,
             options.class_usage,
+            options.subprocess_coverage,
         ),
         options.output,
     )

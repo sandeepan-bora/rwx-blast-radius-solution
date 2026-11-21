@@ -49,10 +49,10 @@ def parse_patch(text: str) -> list[ChangedFile]:
             old_path = match.group(1) if match else ""
             current = ChangedFile(match.group(2) if match else "")
             old_line = None
-        elif current is not None and line.startswith("--- "):
+        elif current is not None and old_line is None and line.startswith("--- "):
             if line.startswith("--- a/"):
                 old_path = line[6:]
-        elif current is not None and line.startswith("+++ "):
+        elif current is not None and old_line is None and line.startswith("+++ "):
             if line.startswith("+++ b/"):
                 current.path = line[6:]
             elif line == "+++ /dev/null":
@@ -61,11 +61,11 @@ def parse_patch(text: str) -> list[ChangedFile]:
             match = re.search(r"-(\d+)", line)
             old_line = int(match.group(1)) if match else None
         elif current is not None and old_line is not None:
-            if line.startswith("-") and not line.startswith("---"):
+            if line.startswith("-"):
                 current.points.add(old_line)
                 current.removed.append(line[1:].strip())
                 old_line += 1
-            elif line.startswith("+") and not line.startswith("+++"):
+            elif line.startswith("+"):
                 # An insertion is associated with the following old-tree line.
                 current.points.add(old_line)
                 current.added.append(line[1:].strip())
@@ -77,11 +77,21 @@ def parse_patch(text: str) -> list[ChangedFile]:
     return [change for change in changes if change.path]
 
 
-def is_comment_only(change: ChangedFile) -> bool:
+def is_comment_only(change: ChangedFile, file_map: dict | None = None) -> bool:
     """Recognize Python-style comment/blank-only edits independently per file."""
 
     changed = change.added + change.removed
-    return bool(changed) and all(not line or line.startswith("#") for line in changed)
+    # SQL fixture lines such as "# dialect: bigquery" are parsed as metadata.
+    # A leading hash is not generally a comment outside Python source files.
+    if file_map and any(
+        start < point <= end
+        for start, end in file_map.get("strings", [])
+        for point in change.points
+    ):
+        return False
+    return change.path.endswith(".py") and bool(changed) and all(
+        not line or line.startswith("#") for line in changed
+    )
 
 
 def is_control_flow_mutation(change: ChangedFile) -> bool:
@@ -175,13 +185,16 @@ def select_test_ids(
 
     for change in parse_patch(patch_text):
         path = change.path
-        if is_comment_only(change):
+        if is_comment_only(change, files.get(path)):
             continue
 
         if path.startswith("tests/fixtures/"):
             mapped = fixture_map.get(path)
             if mapped is None:
-                selected_ids.update(_fixture_fallback_ids(path, tests))
+                fallback = _fixture_fallback_ids(path, tests)
+                selected_ids.update(fallback)
+                if not fallback and Path(path).suffix in {".sql", ".json", ".csv", ".txt"}:
+                    selected_ids.update(known_ids)
             else:
                 selected_indices.update(mapped)
             continue
@@ -193,10 +206,12 @@ def select_test_ids(
                 continue
 
         if not path.startswith("sqlglot/") and path not in files:
+            if (path.startswith("tests/") and Path(path).suffix in {".py", ".sql", ".json", ".csv", ".txt"}) or path in {"pyproject.toml", "setup.cfg", "pytest.ini", "conftest.py"}:
+                selected_ids.update(known_ids)
             continue
 
         file_map = files.get(path, {})
-        has_unowned_point = False
+        has_unowned_point = not change.points
         for point in change.points:
             owners = (
                 _scope_ids(file_map, point)
@@ -211,6 +226,14 @@ def select_test_ids(
             selected_indices.update(all_file_indices)
             if all_file_indices:
                 has_unowned_point = False
+
+        # An uncovered branch or new symbol can still affect existing callers.
+        # Retain every observed test for the file when no narrower owner exists.
+        if has_unowned_point:
+            if all_file_indices:
+                selected_indices.update(all_file_indices)
+            elif path.endswith(".py"):
+                selected_ids.update(known_ids)
 
         parts = Path(path).parts
         family = parts[1] if len(parts) > 2 else ""
@@ -246,6 +269,11 @@ def select_test_ids(
         if family == "typing":
             add_known("tests/test_optimizer.py::TestOptimizer::test_optimize")
 
+        if family == "executor":
+            # Query execution can take different branches after a mutation.
+            # Baseline coverage alone missed a failing TPC-DS integration test.
+            selected_ids.update(_tests_in_file(tests, "tests/test_executor.py"))
+
         if family == "optimizer":
             add_known(
                 f"tests/test_optimizer.py::TestOptimizer::test_{stem}",
@@ -272,7 +300,7 @@ def select_test_ids(
 
 
 def schedule(tests: list[dict]) -> list[list[int]]:
-    """Choose 1..8 workers by LPT and the contest's exact millisecond cost."""
+    """Choose a low-cost partition without changing the selected tests."""
 
     if not tests:
         return []
@@ -291,6 +319,28 @@ def schedule(tests: list[dict]) -> list[list[int]]:
             workers[lightest].append(test["number"])
             loads[lightest] += round(test["seconds"] * 1000)
         candidates.append((max(loads) + WORKER_COST_MS * worker_count, workers))
+
+    # For small selections, find the optimal two-worker split exactly. A bitset
+    # tracks achievable millisecond loads; checkpoints reconstruct the workers.
+    if 2 <= len(ordered) <= 32:
+        durations = [round(test["seconds"] * 1000) for test in ordered]
+        total = sum(durations)
+        if total <= 200_000:
+            states = [1]
+            for duration in durations:
+                states.append(states[-1] | (states[-1] << duration))
+            half = total // 2
+            target = (states[-1] & ((1 << (half + 1)) - 1)).bit_length() - 1
+            selected_load = target
+            light, heavy = [], []
+            for index in range(len(ordered) - 1, -1, -1):
+                if (states[index] >> target) & 1:
+                    heavy.append(ordered[index]["number"])
+                else:
+                    light.append(ordered[index]["number"])
+                    target -= durations[index]
+            if light and heavy:
+                candidates.append((max(selected_load, total - selected_load) + 2 * WORKER_COST_MS, [light, heavy]))
     return min(candidates, key=lambda candidate: (candidate[0], len(candidate[1])))[1]
 
 

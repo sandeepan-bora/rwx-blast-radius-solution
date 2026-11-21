@@ -111,7 +111,17 @@ make sample
 non-root runtime. The unit/integration test can run without Docker. The exact
 sample score and local CPU measurement are recorded below after verification.
 
-## Verification status
+## 172-second selection
+
+This version adds fixture-metadata and executor-integration safeguards to the
+prior 480.2-second practice entry. Its public-sample score is approximately
+172.654 simulated seconds with zero misses; the hidden score is unverified.
+The map does not collect coverage from spawned test workers, unlike the more
+conservative 212.694-second local variant, so some dependencies may be missed.
+The executor fallback includes the complete executor test file to reduce that
+risk. The submitted practice result cannot be inferred from the public sample.
+
+## Previous verification status
 
 - Pinned test collection: 1,620 scored tests plus the one test listed as skipped.
 - Unchanged starter baseline: **1,210.470 simulated seconds, 0 misses**.
@@ -126,9 +136,7 @@ sample score and local CPU measurement are recorded below after verification.
   when supplied a conservative 0.04-second local CPU measurement. The added
   ~10.8 simulated seconds are a deliberate recall premium for class constants,
   previously unowned fixtures, and shared test helpers.
-- Revised hidden/practice score: **not measured yet**. Any sub-160 estimate is a
-  projection, not a verified leaderboard result.
-- Unit/integration tests: **9 passed**.
+- Revised v2 practice score: **480.2 seconds**, with one missed commit.
 - Submission directory size during verification: **1.2 MB**, below the 20 MB
   repository limit.
 - Docker was not available on the verification host, so `make sample` itself was
