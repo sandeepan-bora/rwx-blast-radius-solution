@@ -31,7 +31,7 @@ its tests independently.
 
 ## Design
 
-The selector combines six reusable signals:
+The selector combines seven reusable signals:
 
 1. **Per-function coverage scopes.** `impact_map.json.gz` records which tests
    executed each function in the unmodified pinned repository.
@@ -45,9 +45,11 @@ The selector combines six reusable signals:
    derived from the pinned suite.
 4. **Shared test-helper coverage.** Changes to `tests/helpers.py` route to the
    tests that execute the changed helper instead of selecting nothing.
-5. **Family fallbacks.** Dialect/parser/generator changes include their direct
+5. **Cross-module symbol ownership.** A static import/use map connects module
+   constants and imported classes to the tests covering their consumers.
+6. **Family fallbacks.** Dialect/parser/generator changes include their direct
    dialect tests; shared or import-time behavior gets small conservative sentinels.
-6. **Patch risk.** Comment-only files select nothing. Optimizer control-flow
+7. **Patch risk.** Comment-only files select nothing. Optimizer control-flow
    mutations add the slow integration sentinels because their blast radius is
    substantially wider.
 
@@ -126,7 +128,7 @@ sample score and local CPU measurement are recorded below after verification.
   previously unowned fixtures, and shared test helpers.
 - Revised hidden/practice score: **not measured yet**. Any sub-160 estimate is a
   projection, not a verified leaderboard result.
-- Unit/integration tests: **8 passed**.
+- Unit/integration tests: **9 passed**.
 - Submission directory size during verification: **1.2 MB**, below the 20 MB
   repository limit.
 - Docker was not available on the verification host, so `make sample` itself was

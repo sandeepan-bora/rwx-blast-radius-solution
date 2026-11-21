@@ -107,6 +107,21 @@ diff --git a/tests/helpers.py b/tests/helpers.py
         selected = self.select(patch)
         self.assertIn("tests/test_transpile.py::TestTranspile::test_identity", selected)
 
+    def test_imported_module_global_has_cross_module_owners(self) -> None:
+        patch = """\
+diff --git a/sqlglot/executor/env.py b/sqlglot/executor/env.py
+--- a/sqlglot/executor/env.py
++++ b/sqlglot/executor/env.py
+@@ -249 +249 @@
+-ENV = {
++ENV = dict({
+"""
+        selected = self.select(patch)
+        self.assertIn(
+            "tests/test_executor.py::TestExecutor::test_execute_subqueries",
+            selected,
+        )
+
     def test_sample_is_valid_zero_miss_and_below_target(self) -> None:
         sample = ROOT / "sample"
         if not sample.exists():

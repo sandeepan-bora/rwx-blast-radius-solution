@@ -102,6 +102,7 @@ def _class_scopes(
     usage: dict[str, list[str]],
     index_by_id: dict[str, int],
     contexts_by_line: dict[int, set[int]],
+    external_usage: dict[tuple[str, str], set[int]],
 ) -> list[list]:
     scopes: list[list] = []
 
@@ -115,6 +116,7 @@ def _class_scopes(
                 for test_id in usage.get(f"{module}.{qualname}", ())
                 if test_id in index_by_id
             }
+            selected.update(external_usage.get((module, qualname), ()))
             # Generic classes are not part of the runtime usage tracer.  Tests
             # that execute any method of such a class are still a strong owner
             # signal for constants and registries declared in its body.
@@ -126,6 +128,119 @@ def _class_scopes(
 
     visit(getattr(tree, "body", []))
     return sorted(scopes, key=lambda scope: (scope[0], scope[1]))
+
+
+def _global_scopes(
+    tree: ast.AST,
+    module: str,
+    contexts_by_line: dict[int, set[int]],
+    external_usage: dict[tuple[str, str], set[int]],
+) -> list[list]:
+    """Map module assignments to tests covering same-module readers."""
+
+    readers: dict[str, set[int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        covered: set[int] = set()
+        for line in range(node.lineno, node.end_lineno + 1):
+            covered.update(contexts_by_line.get(line, ()))
+        if not covered:
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                readers.setdefault(child.id, set()).update(covered)
+
+    scopes: list[list] = []
+    for node in getattr(tree, "body", []):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        if not targets:
+            continue
+        names = {
+            child.id
+            for target in targets
+            for child in ast.walk(target)
+            if isinstance(child, ast.Name)
+        }
+        selected = set().union(*(readers.get(name, set()) for name in names))
+        for name in names:
+            selected.update(external_usage.get((module, name), ()))
+        if selected:
+            scopes.append([node.lineno, node.end_lineno, sorted(selected)])
+    return scopes
+
+
+def _cross_module_usage(
+    repo: Path,
+    data: CoverageData,
+    index_by_context: dict[str, int],
+) -> tuple[dict[tuple[str, str], set[int]], dict[tuple[str, str], set[int]]]:
+    """Find tests covering functions that use directly imported symbols/classes."""
+
+    symbol_usage: dict[tuple[str, str], set[int]] = {}
+    class_usage: dict[tuple[str, str], set[int]] = {}
+    repo = repo.resolve()
+    for measured_path in data.measured_files():
+        source_path = Path(measured_path).resolve()
+        try:
+            relative = source_path.relative_to(repo).as_posix()
+        except ValueError:
+            continue
+        if not relative.startswith(("sqlglot/", "tests/")):
+            continue
+        try:
+            tree = ast.parse(source_path.read_text("utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+
+        imports: dict[str, tuple[str, str | None]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.startswith("sqlglot"):
+                    for alias in node.names:
+                        imports[alias.asname or alias.name] = (node.module, alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("sqlglot"):
+                        local = alias.asname or alias.name.split(".", 1)[0]
+                        imports.setdefault(local, (alias.name, None))
+        if not imports:
+            continue
+
+        contexts_by_line = {
+            line: {
+                index_by_context[context]
+                for context in contexts
+                if context in index_by_context
+            }
+            for line, contexts in data.contexts_by_lineno(measured_path).items()
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            covered: set[int] = set()
+            for line in range(node.lineno, node.end_lineno + 1):
+                covered.update(contexts_by_line.get(line, ()))
+            if not covered:
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                    imported = imports.get(child.id)
+                    if imported and imported[1] is not None:
+                        symbol_usage.setdefault(imported, set()).update(covered)
+                elif isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
+                    imported = imports.get(child.value.id)
+                    if imported:
+                        module, symbol = imported
+                        if symbol is None:
+                            symbol_usage.setdefault((module, child.attr), set()).update(covered)
+                        else:
+                            class_usage.setdefault((module, symbol), set()).update(covered)
+    return symbol_usage, class_usage
 
 
 def build_map(
@@ -146,6 +261,9 @@ def build_map(
 
     data = CoverageData(basename=str(coverage_path.resolve()))
     data.read()
+    external_symbols, external_classes = _cross_module_usage(
+        repo, data, index_by_context
+    )
     files: dict[str, dict] = {}
     repo = repo.resolve()
 
@@ -169,6 +287,7 @@ def build_map(
         all_indices = sorted(set().union(*contexts_by_line.values())) if contexts_by_line else []
         scopes: list[list] = []
         classes: list[list] = []
+        globals_: list[list] = []
         try:
             tree = ast.parse(source_path.read_text("utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
@@ -183,15 +302,29 @@ def build_map(
                 if selected:
                     scopes.append([node.lineno, node.end_lineno, sorted(selected)])
             module = relative[:-3].replace("/", ".")
+            if module.endswith(".__init__"):
+                module = module.removesuffix(".__init__")
             classes = _class_scopes(
                 tree,
                 module,
                 class_usage,
                 index_by_id,
                 contexts_by_line,
+                external_classes,
+            )
+            globals_ = _global_scopes(
+                tree,
+                module,
+                contexts_by_line,
+                external_symbols,
             )
         scopes.sort(key=lambda scope: (scope[0], scope[1]))
-        files[relative] = {"all": all_indices, "scopes": scopes, "classes": classes}
+        files[relative] = {
+            "all": all_indices,
+            "scopes": scopes,
+            "classes": classes,
+            "globals": globals_,
+        }
 
     fixtures: dict[str, list[int]] = {}
     dialect_fixture_refs: dict[str, set[int]] = {}

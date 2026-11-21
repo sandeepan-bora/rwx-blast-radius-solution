@@ -122,6 +122,13 @@ def _class_ids(file_map: dict, line: int) -> set[int]:
     return set(smallest[2])
 
 
+def _global_ids(file_map: dict, line: int) -> set[int]:
+    for scope in file_map.get("globals", []):
+        if scope[0] <= line <= scope[1]:
+            return set(scope[2])
+    return set()
+
+
 def _fixture_fallback_ids(path: str, tests: list[dict]) -> set[str]:
     """Route a new/unmapped fixture using its directory and normalized stem."""
 
@@ -189,13 +196,21 @@ def select_test_ids(
             continue
 
         file_map = files.get(path, {})
+        has_unowned_point = False
         for point in change.points:
-            scoped = _scope_ids(file_map, point)
-            selected_indices.update(scoped or _class_ids(file_map, point))
+            owners = (
+                _scope_ids(file_map, point)
+                or _class_ids(file_map, point)
+                or _global_ids(file_map, point)
+            )
+            selected_indices.update(owners)
+            has_unowned_point = has_unowned_point or not owners
 
         all_file_indices = file_map.get("all", [])
         if len(all_file_indices) <= SMALL_FILE_CONTEXT_LIMIT:
             selected_indices.update(all_file_indices)
+            if all_file_indices:
+                has_unowned_point = False
 
         parts = Path(path).parts
         family = parts[1] if len(parts) > 2 else ""
@@ -204,7 +219,7 @@ def select_test_ids(
         # Top-level modules have direct test files but no family-specific rule.
         # This primarily protects module constants and import-time registries,
         # which per-test coverage cannot observe during collection.
-        if len(parts) == 2:
+        if len(parts) == 2 and has_unowned_point:
             selected_ids.update(_tests_in_file(tests, f"tests/test_{stem}.py"))
 
         if family in {"dialects", "parsers", "generators"} and stem not in {
@@ -214,6 +229,9 @@ def select_test_ids(
             "generator",
         }:
             selected_ids.update(_tests_in_file(tests, f"tests/dialects/test_{stem}.py"))
+
+        if family == "dialects" and stem == "dialect" and has_unowned_point:
+            selected_ids.update(_tests_in_file(tests, "tests/dialects/test_dialect.py"))
 
         if family == "dialects":
             selected_indices.update(dialect_fixture_refs.get(stem, []))
