@@ -1,0 +1,8 @@
+# Keep the exact interpreter image used to label the contest data.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+WORKDIR /app
+COPY --chmod=0444 selector.py impact_map.json.gz /app/
+
+USER 65534:65534
+CMD ["python", "/app/selector.py"]
